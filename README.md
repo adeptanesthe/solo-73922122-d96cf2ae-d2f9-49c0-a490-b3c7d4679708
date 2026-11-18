@@ -49,9 +49,76 @@ debug panel.
 
 - `GET /health` — liveness probe
 - `POST /api/v1/inspect` — multipart upload of two 512×512 grayscale PNGs
+- `POST /api/v1/placement` — component placement verification (below)
 - Inputs that are not 512×512 grayscale images return HTTP 400.
 - A content-level inability to decide is HTTP 200 with
   `status: "undeterminable"` and a machine-readable `reason_code`.
+
+## Component placement verification (`POST /api/v1/placement`)
+
+After assembly, two visually different SMD components can end up in each
+other's reference positions. This endpoint compares the components on an
+inspected board against the golden board and reports a verdict per
+reference position.
+
+### Request (multipart form)
+
+| field              | content                                                                                  |
+|--------------------|------------------------------------------------------------------------------------------|
+| `golden`           | 512×512 grayscale golden-board PNG                                                       |
+| `inspected`        | 512×512 grayscale inspected-board PNG                                                    |
+| `reference_boxes`  | JSON list of **up to 6** mutually non-overlapping **32×32** boxes on the golden image   |
+| `candidate_boxes`  | JSON list of **up to 6** **32×32** candidate boxes on the inspected image (any order)   |
+
+Box object: `{"x": 80, "y": 80, "w": 32, "h": 32}`. The candidate boxes
+must cover every visible component at the marked reference positions;
+their order is irrelevant. Invalid box sizes, counts, frame bounds or
+overlapping reference boxes return HTTP 400.
+
+### How it decides
+
+1. The **same** robust ECC affine registration and Huber-IRLS exposure
+   compensation as `/api/v1/inspect` are reused, with the same trust
+   gates. If the warp or exposure fit is not trustworthy (solid color,
+   periodic texture, low correlation, implausible warp, …) the **whole
+   board** is refused: every position returns `undeterminable`, never a
+   false `correct` or `missing`.
+2. The inspected image is back-rendered into golden-frame geometry and
+   corrected to golden intensity scale. Each candidate center is mapped
+   back to the golden frame and assigned to at most one reference
+   position by minimum center distance (exhaustive one-to-one
+   assignment, ≤ 6! combinations). **A candidate can never back two
+   positions**, so a two-part swap surfaces as two `wrong` verdicts at
+   once.
+3. Component identity is scored inside the canonical 32×32 windows with
+   normalized cross correlation (structure) and a Gaussian-blurred mean
+   absolute error (mean level — this still separates flat, low-texture
+   parts). Both measures are exposure-invariant after step 1.
+4. If the observed content matches another golden component nearly as
+   well as this position's own (look-alike / identical parts), only the
+   affected positions are refused (`IDENTITY_AMBIGUOUS`); all other
+   decidable positions still return their firm verdict.
+5. A reference position with no geometrically covering candidate is
+   `missing` only when the corrected footprint clearly differs from the
+   golden component; otherwise it is refused (`NO_GEOMETRIC_CANDIDATE`).
+
+### Per-reference `verdict`
+
+| value             | meaning                                                                 |
+|-------------------|-------------------------------------------------------------------------|
+| `correct`         | the assigned candidate matches this position's golden component        |
+| `wrong`           | the assigned candidate is a different component (covers swapped parts) |
+| `missing`         | no candidate covers the position and the footprint content is foreign  |
+| `undeterminable`  | identity is ambiguous / inconclusive, or the whole board was refused   |
+
+Each result echoes the assigned `candidate_box` (in inspected-image
+coordinates), NCC/MAE scores, the margin to the runner-up identity and
+the geometric center distance. Unassigned candidates are listed
+separately. Per-position `reason_code` values: `WRONG_COMPONENT`,
+`NO_CANDIDATE_AT_POSITION`, `NO_GEOMETRIC_CANDIDATE`,
+`IDENTITY_AMBIGUOUS`, `MATCH_INCONCLUSIVE`,
+`INSUFFICIENT_WINDOW_OVERLAP`; a whole-board refusal uses the
+registration/exposure codes listed below.
 
 ### Response `status`
 
@@ -128,11 +195,14 @@ app/
     geometry.py            robust multi-scale ECC, warp helpers, trust bounds
     trust.py               solid-color / low-texture / periodicity gates
     exposure.py            Huber-IRLS gain/bias fit, residual defect detection
-    detector.py            end-to-end orchestration (array-only entry point)
+    detector.py            end-to-end re-inspection (array-only entry point)
+    placement.py           placement verification: geometry + component identity
 tests/
   synth/generator.py       fixed-seed synthetic board + defect generator
+  synth/placement_cases.py fixed-seed swap/missing/ambiguous placement scenarios
   synth/generate_samples.py  CLI to persist the suite
   evaluate.py              independent scorer + detector independence audit
   test_api.py              pytest API and pipeline tests
+  test_placement.py        pytest placement-verification tests
 Dockerfile, docker-compose.yml, requirements.txt
 ```

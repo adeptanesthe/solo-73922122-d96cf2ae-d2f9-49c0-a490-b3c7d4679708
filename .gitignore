@@ -1,0 +1,11 @@
+# Local Python dependency target (installed outside the container image)
+/.pydeps/
+/.venv/
+
+# Python caches and test artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Regenerated evaluation output
+/eval_samples/
